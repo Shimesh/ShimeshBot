@@ -1,7 +1,12 @@
 import os
 import random
 import asyncio
+import re
+import html
 from datetime import time as dtime
+from xml.etree import ElementTree as ET
+import urllib.request
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -9,7 +14,66 @@ from telegram.ext import (
 )
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
+RSS_URL = "https://rsshub.app/telegram/channel/beforeredalert"
 
+# ── Alert forwarding state ────────────────────────────────────────────────────
+alert_chats   = set()   # chats that opted in to alerts
+seen_alert_ids = set()  # GUIDs already sent
+
+def fetch_rss():
+    try:
+        req = urllib.request.Request(RSS_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.read()
+    except Exception as e:
+        print(f"RSS fetch error: {e}")
+        return None
+
+def parse_rss(data):
+    try:
+        root = ET.fromstring(data)
+        items = root.findall(".//item")
+        results = []
+        for item in items:
+            guid  = (item.findtext("guid")  or "").strip()
+            title = (item.findtext("title") or "").strip()
+            desc  = (item.findtext("description") or "").strip()
+            desc_clean = re.sub(r"<[^>]+>", "", html.unescape(desc)).strip()
+            results.append({"guid": guid, "title": title, "desc": desc_clean})
+        return results
+    except Exception as e:
+        print(f"RSS parse error: {e}")
+        return []
+
+def is_alert(text):
+    keywords = ["שיגור", "ירי", "טיל", "רקטה", "אזעקה", "כיפת ברזל", "יירוט",
+                "חיזבאללה", "חמאס", "עזה", "לבנון", "תימן", "עיראק", "איראן"]
+    return any(k in text for k in keywords)
+
+async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE):
+    if not alert_chats:
+        return
+    data = fetch_rss()
+    if not data:
+        return
+    items = parse_rss(data)
+    for item in reversed(items):  # oldest first
+        guid = item["guid"]
+        if guid in seen_alert_ids:
+            continue
+        seen_alert_ids.add(guid)
+        text = item["title"] + " " + item["desc"]
+        if not is_alert(text):
+            continue
+        # Format the message
+        msg = f"🚨 *התרעה על שיגור!*\n\n{item['desc'][:400]}\n\n_מקור: @beforeredalert_"
+        for cid in list(alert_chats):
+            try:
+                await ctx.bot.send_message(cid, msg, parse_mode="Markdown")
+            except Exception as e:
+                print(f"Alert send error to {cid}: {e}")
+
+# ── Questions ─────────────────────────────────────────────────────────────────
 QUESTIONS = {
     "easy": [
         {"q": "כמה גרמים יש בקילוגרם?", "opts": {"א": "100", "ב": "500", "ג": "1000", "ד": "2000"}, "ans": "ג"},
@@ -86,7 +150,6 @@ def s_board(cid, n=10):
 def s_stats(cid, uid):
     return SCORES.get(str(cid),{}).get(str(uid))
 
-# ── Keyboards ─────────────────────────────────────────────────────────────────
 def after_menu():
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("❓ שאלה נוספת", callback_data="m_another"),
@@ -118,13 +181,37 @@ def tol_submit_menu():
         InlineKeyboardButton("👁 חשוף הכל",  callback_data="tol_do_reveal"),
     ]])
 
+def story_kb():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✍️ הוסף משפט", callback_data="story_prompt"),
+        InlineKeyboardButton("📖 קרא",        callback_data="story_read_cb"),
+        InlineKeyboardButton("🏁 סיים",        callback_data="story_end_cb"),
+    ]])
+
 # ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎮 *ברוכים הבאים ל-GameBot!*\n\n"
-        "בחרו משחק מהתפריט למטה 👇",
+        "🚨 /alerts — הפעל התרעות שיגורים\n\n"
+        "בחרו משחק מהתפריט 👇",
         parse_mode="Markdown", reply_markup=games_menu()
     )
+
+# ── Alerts ────────────────────────────────────────────────────────────────────
+async def alerts_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if cid in alert_chats:
+        alert_chats.discard(cid)
+        await update.message.reply_text("🔕 התרעות שיגורים הושבתו.\nכתבו /alerts להפעלה מחדש.")
+    else:
+        alert_chats.add(cid)
+        await update.message.reply_text(
+            "🚨 *התרעות שיגורים הופעלו!*\n\n"
+            "הבוט יבדוק את @beforeredalert כל 30 שניות\n"
+            "וישלח לכם התרעות בזמן אמת 🔴\n\n"
+            "כתבו /alerts שוב לביטול.",
+            parse_mode="Markdown"
+        )
 
 # ── Callback router ───────────────────────────────────────────────────────────
 async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -133,7 +220,7 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if d.startswith("d_"):
         _, action, diff = d.split("_")
-        if action == "trivia":      await ask_trivia(ctx, cid, diff)
+        if action == "trivia":       await ask_trivia(ctx, cid, diff)
         elif action == "tournament": await start_tourn(ctx, cid, diff)
 
     elif d == "m_another":    await q.message.reply_text("בחרו רמת קושי:", reply_markup=diff_menu("trivia"))
@@ -149,41 +236,28 @@ async def cb_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("\n".join(lines), parse_mode="Markdown")
     elif d == "m_tol":
         tol[cid]={"submissions":[],"votes":{},"active":True}
-        await q.message.reply_text(
-            "🤥 *אמת או שקר התחיל!*\n\nלחצו על ׳שלח עובדה׳ — כל אחד בתורו.\nכשכולם סיימו לחצו ׳חשוף הכל׳:",
-            parse_mode="Markdown", reply_markup=tol_submit_menu()
-        )
+        await q.message.reply_text("🤥 *אמת או שקר!*\nלחצו ׳שלח עובדה׳ — כל אחד בתורו:", parse_mode="Markdown", reply_markup=tol_submit_menu())
     elif d == "m_story":
         opener=random.choice(STORY_OPENERS)
         story[cid]={"opener":opener,"entries":[],"last_user":None,"active":True}
-        add_kb=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✍️ הוסף משפט", callback_data="story_prompt"),
-            InlineKeyboardButton("📖 קרא סיפור",  callback_data="story_read_cb"),
-            InlineKeyboardButton("🏁 סיים",        callback_data="story_end_cb"),
-        ]])
-        await q.message.reply_text(f"📖 *סיפור קבוצתי!*\n\n_{opener}_\n\nלחצו ׳הוסף משפט׳ כדי להמשיך:", parse_mode="Markdown", reply_markup=add_kb)
-
+        await q.message.reply_text(f"📖 *סיפור קבוצתי!*\n\n_{opener}_\n\nלחצו ׳הוסף משפט׳:", parse_mode="Markdown", reply_markup=story_kb())
     elif d == "tol_prompt":
-        await q.message.reply_text("✍️ כתבו את העובדה שלכם בהודעה הבאה (הבוט יזהה אוטומטית):")
+        await q.message.reply_text("✍️ כתבו את העובדה שלכם:")
         ctx.user_data["awaiting_tol"] = cid
     elif d == "tol_do_reveal":
         await do_tol_reveal(ctx, cid)
-    elif d.startswith("tol_vote_"):
-        await tol_vote_cb(update, ctx)
-
     elif d == "story_prompt":
-        await q.message.reply_text("✍️ כתבו את המשפט שלכם להמשך הסיפור:")
+        await q.message.reply_text("✍️ כתבו את המשפט שלכם:")
         ctx.user_data["awaiting_story"] = cid
     elif d == "story_read_cb":
         if cid not in story: await q.message.reply_text("אין סיפור פעיל."); return
         parts=[story[cid]["opener"]]+[t for _,_,t in story[cid]["entries"]]
-        await q.message.reply_text(f"📖 *הסיפור עד כה:*\n\n_{' '.join(parts)}_", parse_mode="Markdown")
+        await q.message.reply_text(f"📖 *הסיפור:*\n\n_{' '.join(parts)}_", parse_mode="Markdown")
     elif d == "story_end_cb":
         if cid not in story: return
         parts=[story[cid]["opener"]]+[t for _,_,t in story[cid]["entries"]]
         story[cid]["active"]=False
         await q.message.reply_text(f"📖 *הסיפור הושלם! 🎉*\n\n_{' '.join(parts)}_\n\n{len(story[cid]['entries'])} משפטים!", parse_mode="Markdown", reply_markup=games_menu())
-
     elif d.startswith("tol_"):
         await tol_vote_cb(update, ctx)
 
@@ -198,10 +272,7 @@ async def ask_trivia(ctx, cid, diff="medium"):
     trivia[cid]={"q":q,"answered":{},"correct_count":0,"active":True,"diff":diff}
     kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"{l}) {a}", callback_data=f"ans_{l}_{cid}")] for l,a in q["opts"].items()])
     pts=DIFF_PTS[diff][0]
-    await ctx.bot.send_message(cid,
-        f"{DIFF_LABEL[diff]} | ⏱ {t}שנ׳ | 🏅 עד {pts} נק׳\n\n❓ *{q['q']}*",
-        parse_mode="Markdown", reply_markup=kb)
-
+    await ctx.bot.send_message(cid, f"{DIFF_LABEL[diff]} | ⏱ {t}שנ׳ | 🏅 עד {pts} נק׳\n\n❓ *{q['q']}*", parse_mode="Markdown", reply_markup=kb)
     async def timer_warn():
         await asyncio.sleep(t-5)
         if cid in trivia and trivia[cid].get("active"):
@@ -221,15 +292,13 @@ async def ans_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if cid not in trivia or not trivia[cid].get("active"): return
     user=q.from_user; uid=user.id; name=get_name(user)
     game=trivia[cid]
-    if uid in game["answered"]:
-        await q.answer("כבר ענית! ⏳", show_alert=True); return
+    if uid in game["answered"]: await q.answer("כבר ענית! ⏳", show_alert=True); return
     game["answered"][uid]=letter
     correct=game["q"]["ans"]; diff=game["diff"]
     if letter==correct:
         cnt=game["correct_count"]
         pts=DIFF_PTS[diff][0] if cnt==0 else DIFF_PTS[diff][1] if cnt==1 else DIFF_PTS[diff][2]
-        game["correct_count"]+=1
-        s_add(cid,uid,name,pts,ok=True)
+        game["correct_count"]+=1; s_add(cid,uid,name,pts,ok=True)
         ans_text=game["q"]["opts"][correct]
         st=SCORES[str(cid)][str(uid)]["streak"]
         streak_msg=f"\n🔥 רצף של {st}!" if st>=3 else ""
@@ -237,8 +306,7 @@ async def ans_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(f"✅ נכון, *{name}*! +{pts} נק׳ 🎉\nתשובה: *{correct}) {ans_text}*{streak_msg}", parse_mode="Markdown", reply_markup=after_menu())
     else:
         s_add(cid,uid,name,0,bad=True)
-        wrong_text=game["q"]["opts"][letter]
-        await q.answer(f"❌ לא נכון! ({letter}) {wrong_text} שגוי", show_alert=True)
+        await q.answer(f"❌ לא נכון! נסו שוב", show_alert=True)
 
 # ── Tournament ────────────────────────────────────────────────────────────────
 async def tournament_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -255,17 +323,14 @@ async def start_tourn(ctx, cid, diff):
 async def send_tourn_q(ctx, cid):
     t=tourn[cid]
     if t["cur"]>=len(t["qs"]): await end_tourn(ctx,cid); return
-    q=t["qs"][t["cur"]]; t["answered"]=set()
-    n=t["cur"]+1; total=len(t["qs"]); diff=t["diff"]
+    q=t["qs"][t["cur"]]; t["answered"]=set(); n=t["cur"]+1; total=len(t["qs"]); diff=t["diff"]
     kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"{l}) {a}", callback_data=f"tans_{l}_{cid}")] for l,a in q["opts"].items()])
-    pts=DIFF_PTS[diff][0]
-    await ctx.bot.send_message(cid, f"🎯 שאלה {n}/{total} | {DIFF_LABEL[diff]} | 🏅{pts} נק׳\n\n❓ *{q['q']}*", parse_mode="Markdown", reply_markup=kb)
+    await ctx.bot.send_message(cid, f"🎯 שאלה {n}/{total} | {DIFF_LABEL[diff]}\n\n❓ *{q['q']}*", parse_mode="Markdown", reply_markup=kb)
     cur=t["cur"]
     async def timeout():
         await asyncio.sleep(DIFF_TIME[diff])
         if cid in tourn and tourn[cid].get("active") and tourn[cid]["cur"]==cur:
-            k=q["ans"]; v=q["opts"][k]
-            tourn[cid]["cur"]+=1
+            k=q["ans"]; v=q["opts"][k]; tourn[cid]["cur"]+=1
             await ctx.bot.send_message(cid, f"⏰ הזמן עבר! תשובה: *{k}) {v}*", parse_mode="Markdown")
             await asyncio.sleep(2); await send_tourn_q(ctx,cid)
     asyncio.create_task(timeout())
@@ -282,13 +347,12 @@ async def tans_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         t["answered"].add(uid)
         if uid not in t["round_scores"]: t["round_scores"][uid]={"name":name,"pts":0}
         t["round_scores"][uid]["pts"]+=pts; t["round_scores"][uid]["name"]=name
-        s_add(cid,uid,name,pts,ok=True)
-        ans_text=t["qs"][t["cur"]]["opts"][correct]; t["cur"]+=1
+        s_add(cid,uid,name,pts,ok=True); ans_text=t["qs"][t["cur"]]["opts"][correct]; t["cur"]+=1
         await q.message.reply_text(f"✅ *{name}* +{pts} נק׳! תשובה: *{correct}) {ans_text}*", parse_mode="Markdown")
         await asyncio.sleep(2); await send_tourn_q(ctx,cid)
     else:
         t["answered"].add(uid); s_add(cid,uid,name,0,bad=True)
-        await q.answer(f"❌ לא נכון!", show_alert=True)
+        await q.answer("❌ לא נכון!", show_alert=True)
 
 async def end_tourn(ctx, cid):
     t=tourn[cid]; t["active"]=False
@@ -317,7 +381,7 @@ async def mystats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🏅 ניקוד: *{stats['points']}* נק׳\n"
         f"✅ נכון: {stats['correct']} | ❌ שגוי: {stats['wrong']}\n"
         f"🎯 הצלחה: {pct}%\n{bar}\n"
-        f"🔥 רצף נוכחי: {stats['streak']}",
+        f"🔥 רצף: {stats['streak']}",
         parse_mode="Markdown"
     )
 
@@ -333,7 +397,7 @@ async def daily_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if cid in daily_chats:
         daily_chats.discard(cid); await update.message.reply_text("📅 שאלת היום הושבתה.")
     else:
-        daily_chats.add(cid); await update.message.reply_text("📅 *שאלת יום הופעלה!*\nכל יום ב-10:00 תגיע שאלה 🎉", parse_mode="Markdown")
+        daily_chats.add(cid); await update.message.reply_text("📅 *שאלת יום הופעלה!* כל יום ב-10:00 🎉", parse_mode="Markdown")
 
 async def send_daily(ctx: ContextTypes.DEFAULT_TYPE):
     for cid in list(daily_chats):
@@ -347,16 +411,12 @@ async def send_daily(ctx: ContextTypes.DEFAULT_TYPE):
 async def tol_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid=update.effective_chat.id
     tol[cid]={"submissions":[],"votes":{},"active":True}
-    await update.message.reply_text(
-        "🤥 *אמת או שקר התחיל!*\n\nלחצו ׳שלח עובדה׳ — כל אחד בתורו.\nכשכולם סיימו לחצו ׳חשוף הכל׳:",
-        parse_mode="Markdown", reply_markup=tol_submit_menu()
-    )
+    await update.message.reply_text("🤥 *אמת או שקר!*\nלחצו ׳שלח עובדה׳:", parse_mode="Markdown", reply_markup=tol_submit_menu())
 
 async def do_tol_reveal(ctx, cid):
     if cid not in tol or not tol[cid]["active"]: return
     subs=tol[cid]["submissions"]
-    if len(subs)<2:
-        await ctx.bot.send_message(cid,"צריך לפחות 2 שחקנים!"); return
+    if len(subs)<2: await ctx.bot.send_message(cid,"צריך לפחות 2 שחקנים!"); return
     for i,(uid,name,text,is_truth) in enumerate(subs):
         kb=[[InlineKeyboardButton("✅ אמת",callback_data=f"tol_{i}_true_{uid}"),
              InlineKeyboardButton("❌ שקר",callback_data=f"tol_{i}_false_{uid}")]]
@@ -388,19 +448,13 @@ async def tol_vote_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def story_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid=update.effective_chat.id; opener=random.choice(STORY_OPENERS)
     story[cid]={"opener":opener,"entries":[],"last_user":None,"active":True}
-    add_kb=InlineKeyboardMarkup([[
-        InlineKeyboardButton("✍️ הוסף משפט", callback_data="story_prompt"),
-        InlineKeyboardButton("📖 קרא",        callback_data="story_read_cb"),
-        InlineKeyboardButton("🏁 סיים",        callback_data="story_end_cb"),
-    ]])
-    await update.message.reply_text(f"📖 *סיפור קבוצתי!*\n\n_{opener}_\n\nלחצו ׳הוסף משפט׳:", parse_mode="Markdown", reply_markup=add_kb)
+    await update.message.reply_text(f"📖 *סיפור קבוצתי!*\n\n_{opener}_\n\nלחצו ׳הוסף משפט׳:", parse_mode="Markdown", reply_markup=story_kb())
 
-# ── Text handler (for awaiting states) ────────────────────────────────────────
+# ── Text handler ──────────────────────────────────────────────────────────────
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cid=update.effective_chat.id; user=update.effective_user
     uid=user.id; name=get_name(user); text=update.message.text.strip()
 
-    # Awaiting story sentence
     if ctx.user_data.get("awaiting_story") == cid:
         del ctx.user_data["awaiting_story"]
         if cid not in story or not story[cid].get("active"):
@@ -410,29 +464,24 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         story[cid]["entries"].append((uid,name,text)); story[cid]["last_user"]=uid
         s_add(cid,uid,name,10,ok=True); count=len(story[cid]["entries"])
         extra=f"\n\n🎲 _וואו {count} משפטים!_" if count%5==0 else ""
-        add_kb=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✍️ הוסף משפט", callback_data="story_prompt"),
-            InlineKeyboardButton("📖 קרא",        callback_data="story_read_cb"),
-            InlineKeyboardButton("🏁 סיים",        callback_data="story_end_cb"),
-        ]])
-        await update.message.reply_text(f"✍️ *{name}* הוסיף: _{text}_ +10 נק׳{extra}", parse_mode="Markdown", reply_markup=add_kb)
+        await update.message.reply_text(f"✍️ *{name}*: _{text}_ +10 נק׳{extra}", parse_mode="Markdown", reply_markup=story_kb())
         return
 
-    # Awaiting tol submission
     if ctx.user_data.get("awaiting_tol") == cid:
         del ctx.user_data["awaiting_tol"]
         if cid not in tol or not tol[cid]["active"]: return
-        is_truth=random.choice([True,False])
-        tol[cid]["submissions"].append((uid,name,text,is_truth))
-        await update.message.reply_text(f"✅ *{name}* שלח עובדה! 🤫\nלחצו ׳שלח עובדה׳ לשחקן הבא:", parse_mode="Markdown", reply_markup=tol_submit_menu())
+        tol[cid]["submissions"].append((uid,name,text,random.choice([True,False])))
+        await update.message.reply_text(f"✅ *{name}* שלח עובדה! 🤫\nמי הבא?", parse_mode="Markdown", reply_markup=tol_submit_menu())
         return
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     app=Application.builder().token(TOKEN).build()
     app.job_queue.run_daily(send_daily, time=dtime(hour=10,minute=0))
+    app.job_queue.run_repeating(check_alerts, interval=30, first=10)
 
     app.add_handler(CommandHandler("start",start))
+    app.add_handler(CommandHandler("alerts",alerts_cmd))
     app.add_handler(CommandHandler("scores",scores_cmd))
     app.add_handler(CommandHandler("mystats",mystats_cmd))
     app.add_handler(CommandHandler("reset",reset_cmd))
@@ -445,10 +494,9 @@ def main():
     app.add_handler(CallbackQueryHandler(ans_callback,  pattern="^ans_"))
     app.add_handler(CallbackQueryHandler(tans_callback, pattern="^tans_"))
     app.add_handler(CallbackQueryHandler(cb_handler))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("🤖 GameBot המשודרג רץ!")
+    print("🤖 GameBot + התרעות רץ!")
     app.run_polling()
 
 if __name__=="__main__":
