@@ -94,26 +94,71 @@ def fetch_active_alerts():
 # Track last sent alert to avoid duplicates
 last_alert_hash = {"val": ""}
 
+THREAT_LABELS = {
+    1: "🚀 ירי רקטות וטילים",
+    2: "✈️ חדירת כלי טיס עוין",
+    3: "🏠 חדירת מחבלים",
+    4: "🌊 צונאמי",
+    5: "☢️ אירוע רדיולוגי",
+    6: "⚠️ חומרים מסוכנים",
+    7: "🌍 רעידת אדמה",
+    9: "🚀 ירי רקטות",
+    13: "🚀 ירי רקטות",
+}
+
+def parse_alert_item(item):
+    """Extract city names from a single alert item (handles multiple API formats)"""
+    if not isinstance(item, dict):
+        return []
+    # tzevaadom format: {"cities": ["עיר1","עיר2"], "threat": 1, ...}
+    cities = item.get("cities", [])
+    if isinstance(cities, list) and cities:
+        return [str(c) for c in cities if c]
+    # fallback fields
+    for field in ("name","city","area","region","title"):
+        val = item.get(field)
+        if val and isinstance(val, str) and len(val) > 1:
+            return [val]
+    return []
+
 async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE):
     if not chat_members: return
     try:
-        cities = fetch_active_alerts()
-        if not cities: return
+        raw_alerts = fetch_active_alerts()
+        if not raw_alerts: return
 
-        # Build a hash to avoid re-sending same alert
-        alert_hash = str(sorted(str(c) for c in cities))
+        # Normalize — could be list of alert objects or list of city strings
+        all_cities = []
+        threat_type = 1
+        is_drill = False
+
+        if isinstance(raw_alerts, list):
+            for item in raw_alerts:
+                if isinstance(item, dict):
+                    threat_type = item.get("threat", item.get("category", 1))
+                    is_drill = item.get("isDrill", item.get("is_drill", False))
+                    all_cities.extend(parse_alert_item(item))
+                elif isinstance(item, str):
+                    all_cities.append(item)
+        elif isinstance(raw_alerts, dict):
+            threat_type = raw_alerts.get("threat", 1)
+            is_drill = raw_alerts.get("isDrill", False)
+            all_cities = parse_alert_item(raw_alerts)
+
+        if not all_cities: return
+        if is_drill: return  # skip drills
+
+        # Dedup and hash
+        all_cities = list(dict.fromkeys(all_cities))  # preserve order, remove dups
+        alert_hash = "|".join(sorted(all_cities))
         if alert_hash == last_alert_hash["val"]: return
         last_alert_hash["val"] = alert_hash
 
-        # Format cities list
-        if isinstance(cities[0], dict):
-            city_names = [c.get("name", c.get("city", str(c))) for c in cities]
-        else:
-            city_names = [str(c) for c in cities]
+        threat_label = THREAT_LABELS.get(int(threat_type) if str(threat_type).isdigit() else 1, "🚨 התרעה")
+        cities_text = "\n".join(f"• {c}" for c in all_cities[:30])
 
-        cities_text = "\n".join(f"• {c}" for c in city_names[:25])
         msg = (
-            "🚨 *אזעקת צבע אדום!*\n\n"
+            f"🔴 *{threat_label}*\n\n"
             f"*אזורים מותרעים:*\n{cities_text}\n\n"
             "⚠️ *היכנסו למרחב המוגן מיד!*\n"
             "_מקור: פיקוד העורף_"
