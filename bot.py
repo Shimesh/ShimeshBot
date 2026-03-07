@@ -1,6 +1,5 @@
 import os, random, asyncio, re, html, json
 from datetime import time as dtime
-from xml.etree import ElementTree as ET
 import urllib.request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -9,8 +8,10 @@ from telegram.ext import (
 )
 
 TOKEN   = os.environ.get("BOT_TOKEN", "")
-RSS_URL = "https://rsshub.app/telegram/channel/beforeredalert"
-OREF_URL = "https://www.oref.org.il/WarningMessages/alert/alerts.json"
+# Public proxy APIs - work from any IP worldwide
+TZEVA_ADOM_URL  = "https://api.tzevaadom.co.il/notifications"  # real-time active alerts
+TZEVA_HISTORY   = "https://api.tzevaadom.co.il/notifications"
+OREF_PROXY_URL  = "https://red-alert-proxy.vercel.app/api/alerts"  # fallback proxy
 
 # ── State ─────────────────────────────────────────────────────────────────────
 SCORES       = {}
@@ -60,60 +61,70 @@ ALERT_KEYWORDS = [
 def is_ad(text): return any(k.lower() in text.lower() for k in AD_KEYWORDS)
 def is_alert(text): return any(k in text for k in ALERT_KEYWORDS)
 
-def fetch_rss():
-    try:
-        req = urllib.request.Request(RSS_URL, headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r: return r.read()
-    except Exception as e: print(f"RSS error: {e}"); return None
+def fetch_active_alerts():
+    """Fetch live alerts - tries multiple public proxies"""
+    urls = [
+        ("tzevaadom", TZEVA_ADOM_URL),
+        ("proxy",     OREF_PROXY_URL),
+    ]
+    for name, url in urls:
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=6) as r:
+                raw = r.read().decode("utf-8-sig").strip()
+                if not raw or raw in ("null","[]","{}"): return []
+                data = json.loads(raw)
+                # tzevaadom returns {"notifications": [...]}
+                if isinstance(data, dict):
+                    cities = data.get("notifications", data.get("data", []))
+                elif isinstance(data, list):
+                    cities = data
+                else:
+                    cities = []
+                if cities:
+                    print(f"✅ Alerts from {name}: {cities}")
+                    return cities
+        except Exception as e:
+            print(f"Alert fetch {name} error: {e}")
+    return []
 
-def parse_rss(data):
-    try:
-        root = ET.fromstring(data); results=[]
-        for item in root.findall(".//item"):
-            guid = (item.findtext("guid") or "").strip()
-            desc = re.sub(r"<[^>]+>","",html.unescape(item.findtext("description") or "")).strip()
-            results.append({"guid":guid,"desc":desc})
-        return results
-    except: return []
-
-def fetch_oref():
-    try:
-        req = urllib.request.Request(OREF_URL, headers={
-            "User-Agent":"Mozilla/5.0",
-            "Referer":"https://www.oref.org.il/",
-            "X-Requested-With":"XMLHttpRequest"
-        })
-        with urllib.request.urlopen(req, timeout=8) as r:
-            raw = r.read().decode("utf-8-sig")
-            if not raw.strip(): return []
-            return json.loads(raw).get("data",[])
-    except Exception as e: print(f"OREF error: {e}"); return []
+# Track last sent alert to avoid duplicates
+last_alert_hash = {"val": ""}
 
 async def check_alerts(ctx: ContextTypes.DEFAULT_TYPE):
     if not chat_members: return
-    data = fetch_rss()
-    if not data: return
-    items = parse_rss(data)
+    try:
+        cities = fetch_active_alerts()
+        if not cities: return
 
-    for item in reversed(items):
-        guid = item["guid"]
-        if guid in seen_ids: continue
-        seen_ids.add(guid)
-        text = item["desc"]
-        if is_ad(text) or not is_alert(text): continue
+        # Build a hash to avoid re-sending same alert
+        alert_hash = str(sorted(str(c) for c in cities))
+        if alert_hash == last_alert_hash["val"]: return
+        last_alert_hash["val"] = alert_hash
 
-        # Cross-reference with OREF
-        oref_areas = fetch_oref()
-        oref_section = ""
-        if oref_areas:
-            oref_section = "\n\n🔴 *אזעקות פעילות כרגע (פיקוד העורף):*\n" + "\n".join(f"• {a}" for a in oref_areas[:20])
+        # Format cities list
+        if isinstance(cities[0], dict):
+            city_names = [c.get("name", c.get("city", str(c))) for c in cities]
+        else:
+            city_names = [str(c) for c in cities]
 
-        msg = f"🚨 *התרעת שיגור!*\n\n{text[:450]}{oref_section}\n\n_מקור: @beforeredalert_"
-
+        cities_text = "\n".join(f"• {c}" for c in city_names[:25])
+        msg = (
+            "🚨 *אזעקת צבע אדום!*\n\n"
+            f"*אזורים מותרעים:*\n{cities_text}\n\n"
+            "⚠️ *היכנסו למרחב המוגן מיד!*\n"
+            "_מקור: פיקוד העורף_"
+        )
         for cid in list(chat_members.keys()):
             try:
                 await ctx.bot.send_message(cid, msg, parse_mode="Markdown")
-            except Exception as e: print(f"Alert error {cid}: {e}")
+            except Exception as e:
+                print(f"Alert send error {cid}: {e}")
+    except Exception as e:
+        print(f"check_alerts error: {e}")
 
 # ── Questions ─────────────────────────────────────────────────────────────────
 QUESTIONS = {
@@ -473,7 +484,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     app=Application.builder().token(TOKEN).build()
     app.job_queue.run_daily(send_daily,time=dtime(hour=10,minute=0))
-    app.job_queue.run_repeating(check_alerts,interval=30,first=15)
+    app.job_queue.run_repeating(check_alerts,interval=5,first=10)
     app.add_handler(CommandHandler("start",start))
     app.add_handler(CommandHandler("scores",scores_cmd))
     app.add_handler(CommandHandler("reset",reset_cmd))
