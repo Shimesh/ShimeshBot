@@ -1,0 +1,12 @@
+node_modules/
+
+# WhatsApp session data (contains auth tokens)
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Local environment file — never commit secrets
+.env
+
+# Telegram session files (if any local cache)
+*.session
+session.json
